@@ -15,5 +15,3 @@ more details.
 
 Please refer to the [docs](https://docs.rs/lasy) to learn more about how to
 apply these optimisations within your code.
-
-TODO:
