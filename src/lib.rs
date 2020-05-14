@@ -323,41 +323,55 @@ where
     let mut pt_to_id = HashMap::new();
 
     // Build the graph.
-    for seg in segments {
-        match seg.kind {
-            SegmentKind::Blank => (),
-            SegmentKind::Lit => {
-                let pa = &points[seg.start as usize];
-                let pb = &points[seg.end as usize];
-                let ha = point_hash(&pa);
-                let hb = point_hash(&pb);
-                let na = {
-                    let n = pt_to_id.entry(ha).or_insert_with(|| {
-                        let ix = g.add_node(seg.start);
-                        let weight = pa.weight();
-                        Node { ix, weight }
-                    });
-                    n.weight = std::cmp::max(n.weight, pa.weight());
-                    n.ix
-                };
-                let nb = {
-                    let n = pt_to_id.entry(hb).or_insert_with(|| {
-                        let ix = g.add_node(seg.end);
-                        let weight = pb.weight();
-                        Node { ix, weight }
-                    });
-                    n.weight = std::cmp::max(n.weight, pb.weight());
-                    n.ix
-                };
+    let mut segments = segments.into_iter().peekable();
+    let mut prev_seg_kind = None;
+    while let Some(seg) = segments.next() {
+        let prev_kind = prev_seg_kind;
+        prev_seg_kind = Some(seg.kind);
 
-                if na == nb {
-                    continue;
-                }
+        if let SegmentKind::Blank = seg.kind {
+            continue;
+        }
+        let pa = &points[seg.start as usize];
+        let pb = &points[seg.end as usize];
+        let ha = point_hash(&pa);
+        let hb = point_hash(&pb);
+        let na = {
+            let n = pt_to_id.entry(ha).or_insert_with(|| {
+                let ix = g.add_node(seg.start);
+                let weight = pa.weight();
+                Node { ix, weight }
+            });
+            n.weight = std::cmp::max(n.weight, pa.weight());
+            n.ix
+        };
+        let nb = {
+            let n = pt_to_id.entry(hb).or_insert_with(|| {
+                let ix = g.add_node(seg.end);
+                let weight = pb.weight();
+                Node { ix, weight }
+            });
+            n.weight = std::cmp::max(n.weight, pb.weight());
+            n.ix
+        };
 
-                if g.find_edge(na, nb).is_none() {
-                    g.add_edge(na, nb, ());
-                }
+        // If the edge is a loop, only keep it if it describes a lone point.
+        if na == nb {
+            let prev_edge_lit = match prev_kind {
+                Some(SegmentKind::Lit) => true,
+                _ => false,
+            };
+            let mut next_edge_lit = || match segments.peek() {
+                Some(s) if s.kind == SegmentKind::Lit => true,
+                _ => false,
+            };
+            if prev_edge_lit || next_edge_lit() {
+                continue;
             }
+        }
+
+        if g.find_edge(na, nb).is_none() {
+            g.add_edge(na, nb, ());
         }
     }
 
@@ -373,11 +387,31 @@ pub fn point_graph_to_euler_graph(pg: &PointGraph) -> EulerGraph {
     // Find the connected components.
     let ccs = petgraph::algo::kosaraju_scc(pg);
 
+    // Whether or not the edge is a loop (starts and ends at the same node).
+    //
+    // These should be ignored in euler graph construction.
+    fn edge_is_loop<E>(e: &E) -> bool
+    where
+        E: EdgeRef,
+        E::NodeId: PartialEq,
+    {
+        e.source() == e.target()
+    }
+
+    // Whether or not the given node has an even degree.
+    //
+    // A node has an even degree if it has an even number of non-loop edges. A loop edge is an edge
+    // that starts and ends at the same node.
+    fn node_has_even_degree(pg: &PointGraph, n: NodeIndex) -> bool {
+        let non_loop_edges = pg.edges(n).filter(|e| !edge_is_loop(e)).count();
+        non_loop_edges % 2 == 0
+    }
+
     // The indices of the connected components whose nodes all have an even degree.
     let euler_components: HashSet<_> = ccs
         .iter()
         .enumerate()
-        .filter(|(_, cc)| cc.iter().all(|&n| pg.edges(n).count() % 2 == 0))
+        .filter(|(_, cc)| cc.iter().all(|&n| node_has_even_degree(pg, n)))
         .map(|(i, _)| i)
         .collect();
 
@@ -405,7 +439,7 @@ pub fn point_graph_to_euler_graph(pg: &PointGraph) -> EulerGraph {
         } else {
             let v: Vec<_> = cc
                 .iter()
-                .filter(|&&n| pg.edges(n).count() % 2 != 0)
+                .filter(|&&n| !node_has_even_degree(pg, n))
                 .collect();
 
             // If there's a single point, connect to itself.
@@ -422,7 +456,8 @@ pub fn point_graph_to_euler_graph(pg: &PointGraph) -> EulerGraph {
                 assert_eq!(
                     v.len() % 2,
                     0,
-                    "expected even number of odd-degree nodes for non-Euler component",
+                    "expected even number of odd-degree nodes for non-Euler component, found {}",
+                    v.len(),
                 );
                 let prev = *v[0];
                 let inner = v[1..v.len() - 1].iter().map(|&&n| n).collect();
