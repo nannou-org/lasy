@@ -70,6 +70,7 @@ pub use crate::lerp::Lerp;
 
 use petgraph::visit::EdgeRef;
 use petgraph::Undirected;
+pub use petgraph::{Direction, Incoming, Outgoing};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
@@ -149,11 +150,17 @@ pub type PointGraph = petgraph::Graph<PointIndex, (), Undirected, u32>;
 /// A type used to represent a graph of points that contains at least one euler circuit.
 pub type EulerGraph = petgraph::Graph<PointIndex, SegmentKind, Undirected, u32>;
 
-/// A type used to represent a eulerian circuit through a eulerian graph.
-pub type EulerCircuit = Vec<EdgeIndex>;
+/// A type used to represent a eulerian circuit through an eulerian graph.
+///
+/// The `EdgeIndex` referes to an index into the `EulerGraph`. The `Direction` describes whether
+/// traversal is performed from `source` to `target` (`Direction::Outgoing`) or `target` to
+/// `source` (`Direction::Incoming`).
+pub type EulerCircuit = Vec<(EdgeIndex, Direction)>;
 
 type EdgeIndex = petgraph::graph::EdgeIndex<u32>;
 type NodeIndex = petgraph::graph::NodeIndex<u32>;
+type Edge<E> = petgraph::graph::Edge<E, u32>;
+type EgEdge = Edge<SegmentKind>;
 
 /// An iterator yielding all lit line segments.
 #[derive(Clone)]
@@ -454,6 +461,30 @@ pub fn point_graph_to_euler_graph(pg: &PointGraph) -> EulerGraph {
     eg
 }
 
+/// Given some Euler Circuit edge `e` and its direction `d`, return the index of the node that
+/// represents the *start* of the edge.
+pub fn ec_edge_start(eg: &EulerGraph, e: EdgeIndex, d: Direction) -> NodeIndex {
+    fn edge_start(edge: &EgEdge, d: Direction) -> NodeIndex {
+        match d {
+            Outgoing => edge.source(),
+            Incoming => edge.target(),
+        }
+    }
+    edge_start(&eg.raw_edges()[e.index()], d)
+}
+
+/// Given some Euler Circuit edge `e` and its direction `d`, return the index of the node that
+/// represents the *end* of the edge.
+pub fn ec_edge_end(eg: &EulerGraph, e: EdgeIndex, d: Direction) -> NodeIndex {
+    fn edge_end(edge: &EgEdge, d: Direction) -> NodeIndex {
+        match d {
+            Outgoing => edge.target(),
+            Incoming => edge.source(),
+        }
+    }
+    edge_end(&eg.raw_edges()[e.index()], d)
+}
+
 /// Given a Euler Graph describing the vector image to be drawn, return the optimal Euler Circuit
 /// describing the path over which the laser should travel.
 ///
@@ -474,7 +505,7 @@ where
         .next()
         .expect("expected at least two nodes, found none");
     let mut visited: HashSet<EdgeIndex> = HashSet::new();
-    let mut visit_order: Vec<EdgeIndex> = vec![];
+    let mut visit_order: Vec<(EdgeIndex, Direction)> = vec![];
     loop {
         // Find a node in the visit order with untraversed edges, or pick one to begin if we're
         // just starting. We will do a traversal from this node. Keep track of where in the
@@ -485,7 +516,7 @@ where
             false => {
                 match visit_order
                     .iter()
-                    .map(|&e| eg.raw_edges()[e.index()].source())
+                    .map(|&(e, dir)| ec_edge_start(eg, e, dir))
                     .enumerate()
                     .find(|&(_i, n)| eg.edges(n).any(|e| !visited.contains(&e.id())))
                 {
@@ -519,16 +550,19 @@ fn traverse_unvisited<P>(
     start: NodeIndex,
     eg: &EulerGraph,
     visited: &mut HashSet<EdgeIndex>,
-) -> Vec<EdgeIndex>
+) -> Vec<(EdgeIndex, Direction)>
 where
     P: Position,
 {
     let mut n = start;
-    let mut traversal: Vec<EdgeIndex> = vec![];
+    let mut traversal: Vec<(EdgeIndex, Direction)> = vec![];
     loop {
         // Find the straightest edge that hasn't yet been traversed.
         let e_ref = {
-            let mut untraversed_edges = eg.edges(n).filter(|e_ref| !visited.contains(&e_ref.id()));
+            let mut untraversed_edges = eg
+                // Specifies that `n` should be the `source` for each edge reference yielded.
+                .edges_directed(n, Outgoing)
+                .filter(|e_ref| !visited.contains(&e_ref.id()));
 
             let init_e_ref = untraversed_edges
                 .next()
@@ -536,7 +570,7 @@ where
 
             match traversal
                 .last()
-                .map(|e| eg.raw_edges()[e.index()].source())
+                .map(|&(e, dir)| ec_edge_start(eg, e, dir))
                 .map(|n| points[eg[n] as usize].position())
             {
                 // If this is the first edge in the traversal, use the first ref.
@@ -565,9 +599,14 @@ where
 
         // Add the edge into our visitation record.
         let e = e_ref.id();
+        let dir = if n == eg.raw_edges()[e.index()].source() {
+            Direction::Outgoing
+        } else {
+            Direction::Incoming
+        };
         n = e_ref.target();
         visited.insert(e);
-        traversal.push(e);
+        traversal.push((e, dir));
 
         // If this edge brings us back to the start, we have finished this traversal.
         if e_ref.target() == start {
@@ -745,20 +784,23 @@ where
         where
             P: Position + Weight,
         {
-            let e = ec[ix];
-            let e_ref = &eg.raw_edges()[e.index()];
-            let a = &points[eg[e_ref.source()] as usize];
+            let (ab, ab_dir) = ec[ix];
+            let ab_kind = eg[ab];
+            let a_ix = ec_edge_start(eg, ab, ab_dir);
+            let a = &points[eg[a_ix] as usize];
             let a_weight = a.weight();
-            let kind = match e_ref.weight {
+            let kind = match ab_kind {
                 SegmentKind::Blank => EdgeProfileKind::Blank,
                 SegmentKind::Lit => {
                     let a_pos = a.position();
-                    let b = &points[eg[e_ref.target()] as usize];
+                    let b_ix = ec_edge_end(eg, ab, ab_dir);
+                    let b = &points[eg[b_ix] as usize];
                     let b_pos = b.position();
                     let distance = distance_squared(a_pos, b_pos).sqrt();
                     let next_ix = (ix + 1) % ec.len();
-                    let e_ref = &eg.raw_edges()[ec[next_ix].index()];
-                    let c = &points[eg[e_ref.target()] as usize];
+                    let (bc, bc_dir) = ec[next_ix];
+                    let c_ix = ec_edge_end(eg, bc, bc_dir);
+                    let c = &points[eg[c_ix] as usize];
                     let c_pos = c.position();
                     let end_corner = straight_angle_variance(a_pos, b_pos, c_pos);
                     EdgeProfileKind::Lit {
@@ -809,6 +851,7 @@ where
             &self,
             points: &[P],
             e: EdgeIndex,
+            e_dir: Direction,
             eg: &EulerGraph,
             conf: &InterpolationConfig,
             excess_points: u32,
@@ -817,9 +860,10 @@ where
             P: Clone + Into<R> + Position + Weight,
             R: Blanked + Clone + Lerp<Scalar = f32>,
         {
-            let e_ref = &eg.raw_edges()[e.index()];
-            let a = points[eg[e_ref.source()] as usize].clone();
-            let b = points[eg[e_ref.target()] as usize].clone();
+            let a_ix = ec_edge_start(eg, e, e_dir);
+            let b_ix = ec_edge_end(eg, e, e_dir);
+            let a = points[eg[a_ix] as usize].clone();
+            let b = points[eg[b_ix] as usize].clone();
             let br: R = b.into();
             match self.kind {
                 EdgeProfileKind::Blank => {
@@ -849,7 +893,7 @@ where
         .map(|ix| EdgeProfile::from_index(points, ix, ec, eg))
         .collect::<Vec<_>>();
 
-    // TODO: If the circuit doesn't contain any lit edges, what should we do?.
+    // TODO: If the circuit doesn't contain any lit edges, what should we do?
     if !edge_profiles.iter().any(|ep| ep.is_lit()) {
         return vec![];
     }
@@ -932,12 +976,16 @@ where
     let total_points = std::cmp::max(min_points, target_points);
     let mut new_points = Vec::with_capacity(total_points as usize);
     for elem in ec.iter().zip(&edge_profiles).zip(&edge_excess_point_counts) {
-        let ((&ix, ep), &excess) = elem;
-        new_points.extend(ep.points(points, ix, eg, conf, excess));
+        let ((&(e_ix, e_dir), ep), &excess) = elem;
+        new_points.extend(ep.points(points, e_ix, e_dir, eg, conf, excess));
     }
 
     // Push the last point.
-    let last_point = &points[eg[eg.raw_edges()[ec.last().unwrap().index()].target()] as usize];
+    let last_point = {
+        let &(e, dir) = ec.last().unwrap();
+        let end = ec_edge_end(eg, e, dir);
+        &points[eg[end] as usize]
+    };
     new_points.push(last_point.clone().into());
 
     // Sanity check that we generated at least `target_points`.
@@ -954,7 +1002,7 @@ mod test {
         euler_graph_to_euler_circuit, point_graph_to_euler_graph, points_to_segments,
         segments_to_point_graph,
     };
-    use super::{EulerGraph, PointGraph, SegmentKind};
+    use super::{EulerGraph, Outgoing, PointGraph, SegmentKind};
     use crate::{Blanked, IsBlank, Position, Weight};
     use std::collections::HashSet;
     use std::hash::{Hash, Hasher};
@@ -1206,10 +1254,10 @@ mod test {
         let nd = ns.next().unwrap();
 
         let expected = vec![
-            eg.find_edge(na, nb).unwrap(),
-            eg.find_edge(nb, nc).unwrap(),
-            eg.find_edge(nc, nd).unwrap(),
-            eg.find_edge(nd, na).unwrap(),
+            (eg.find_edge(na, nb).unwrap(), Outgoing),
+            (eg.find_edge(nb, nc).unwrap(), Outgoing),
+            (eg.find_edge(nc, nd).unwrap(), Outgoing),
+            (eg.find_edge(nd, na).unwrap(), Outgoing),
         ];
 
         assert_eq!(ec, expected);
@@ -1226,7 +1274,10 @@ mod test {
         assert_eq!(ec.len(), eg.edge_count());
 
         let mut visited = HashSet::new();
-        let mut walk = ec.iter().cycle().map(|&e| (e, &eg.raw_edges()[e.index()]));
+        let mut walk = ec
+            .iter()
+            .cycle()
+            .map(|&(e, _)| (e, &eg.raw_edges()[e.index()]));
         while visited.len() < 4 {
             let (e_id, _) = walk.next().unwrap();
             assert!(visited.insert(e_id));
