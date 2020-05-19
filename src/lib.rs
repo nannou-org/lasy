@@ -172,6 +172,20 @@ where
     last: Option<I::Item>,
 }
 
+/// Capture a profile of each edge to assist the interpolation process.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct EdgeProfile {
+    start_weight: u32,
+    kind: EdgeProfileKind,
+}
+
+/// Edge profile data specific to the kind of edge.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum EdgeProfileKind {
+    Blank,
+    Lit { distance: f32, end_corner: f32 },
+}
+
 /// Configuration options for eulerian circuit interpolation.
 #[repr(C)]
 #[derive(Clone, Debug, PartialEq)]
@@ -206,6 +220,135 @@ impl InterpolationConfig {
 }
 
 // ----------------------------------------------------------------------------
+
+impl EdgeProfile {
+    /// Create an `EdgeProfile` for the edge a->b.
+    ///
+    /// `c` specifies the following node in order to determine the turning angle between a->b and
+    /// b->c.
+    ///
+    /// If `c` is `None`, an angle of `0` is assumed.
+    pub fn from_abc<P>(
+        points: &[P],
+        ab_kind: SegmentKind,
+        a_ix: PointIndex,
+        b_ix: PointIndex,
+        c: Option<PointIndex>,
+    ) -> Self
+    where
+        P: Position + Weight,
+    {
+        let a = &points[a_ix as usize];
+        let start_weight = a.weight();
+        let kind = match ab_kind {
+            SegmentKind::Blank => EdgeProfileKind::Blank,
+            SegmentKind::Lit => {
+                let b = &points[b_ix as usize];
+                let a_pos = a.position();
+                let b_pos = b.position();
+                let distance = distance_squared(a_pos, b_pos).sqrt();
+                let end_corner = match c {
+                    None => 0.0,
+                    Some(c_ix) => {
+                        let c = &points[c_ix as usize];
+                        let c_pos = c.position();
+                        straight_angle_variance(a_pos, b_pos, c_pos)
+                    }
+                };
+                EdgeProfileKind::Lit {
+                    distance,
+                    end_corner,
+                }
+            }
+        };
+        EdgeProfile { start_weight, kind }
+    }
+
+    /// The weight of the point at the start of the edge.
+    pub fn start_weight(&self) -> u32 {
+        self.start_weight
+    }
+
+    /// Edge profile data specific to the kind of edge.
+    pub fn kind(&self) -> &EdgeProfileKind {
+        &self.kind
+    }
+
+    /// Whether or not the edge is blank.
+    pub fn is_blank(&self) -> bool {
+        match self.kind {
+            EdgeProfileKind::Lit { .. } => false,
+            EdgeProfileKind::Blank => true,
+        }
+    }
+
+    /// Whether or not the edge is lit.
+    pub fn is_lit(&self) -> bool {
+        match self.kind {
+            EdgeProfileKind::Lit { .. } => true,
+            EdgeProfileKind::Blank => false,
+        }
+    }
+
+    /// The lit distance covered by this edge.
+    pub fn lit_distance(&self) -> f32 {
+        match self.kind {
+            EdgeProfileKind::Lit { distance, .. } => distance,
+            _ => 0.0,
+        }
+    }
+
+    /// The minimum number of points required to draw the edge.
+    pub fn min_points(&self, conf: &InterpolationConfig) -> u32 {
+        match self.kind {
+            EdgeProfileKind::Blank => {
+                blank_segment_point_count(self.start_weight, conf.blank_delay_points)
+            }
+            EdgeProfileKind::Lit {
+                distance,
+                end_corner,
+            } => lit_segment_min_point_count(
+                distance,
+                end_corner,
+                conf.distance_per_point,
+                conf.radians_per_point,
+                self.start_weight,
+            ),
+        }
+    }
+
+    /// The interpolated points for this edge.
+    pub fn points<P, R>(
+        &self,
+        points: &[P],
+        a_ix: PointIndex,
+        b_ix: PointIndex,
+        conf: &InterpolationConfig,
+        excess_points: u32,
+    ) -> Vec<R>
+    where
+        P: Clone + Into<R> + Position + Weight,
+        R: Blanked + Clone + Lerp<Scalar = f32>,
+    {
+        let a = points[a_ix as usize].clone();
+        let b = points[b_ix as usize].clone();
+        let br: R = b.into();
+        match self.kind {
+            EdgeProfileKind::Blank => {
+                blank_segment_points(a, br, conf.blank_delay_points).collect()
+            }
+            EdgeProfileKind::Lit {
+                end_corner,
+                distance,
+            } => {
+                let dist_point_count = distance_min_point_count(distance, conf.distance_per_point);
+                let corner_point_count = corner_point_count(end_corner, conf.radians_per_point);
+                lit_segment_points(a, br, corner_point_count, dist_point_count, excess_points)
+                    .collect()
+            }
+        }
+    }
+}
 
 impl<'a, T> Position for &'a T
 where
@@ -720,15 +863,15 @@ pub fn distance_min_point_count(dist: f32, min_distance_per_point: f32) -> u32 {
 
 /// The minimum number of points used for a lit segment of the given distance and end angle.
 ///
-/// `a_weight` refers to the weight of the point at the beginning of the segment.
+/// `start_weight` refers to the weight of the point at the beginning of the segment.
 pub fn lit_segment_min_point_count(
     distance: f32,
     end_corner_radians: f32,
     distance_per_point: f32,
     radians_per_point: f32,
-    a_weight: u32,
+    start_weight: u32,
 ) -> u32 {
-    a_weight
+    start_weight
         + corner_point_count(end_corner_radians, radians_per_point)
         + distance_min_point_count(distance, distance_per_point)
 }
@@ -767,176 +910,72 @@ where
     weight_points.chain(dist_points).chain(corner_points)
 }
 
-/// Interpolate the given `EulerCircuit` with the given configuration in order to produce a path
-/// ready to be submitted to the DAC.
+/// Traverse a path described by an iterator yielding edges, profiling the edges along the way.
 ///
-/// The interpolation process will attempt to generate `target_points` number of points along the
-/// circuit, but may generate *more* points in the user's `InterpolationConfig` indicates that more
-/// are required for interpolating the specified circuit.
+/// Produces an iterator yielding an `EdgeProfile` for each edge.
 ///
-/// Performs the following steps:
+/// The path is considered to be a circuit if the end point index of the final edge is equal to the
+/// start point index of the first edge.
 ///
-/// 1. Determine the minimum number of required points:
-///     - 1 for each edge plus the 1 for the end.
-///     - The number of points required for each edge.
-///         - For lit edges:
-///             - The distance of each edge accounting for minimum points per distance.
-///             - The angular distance to the following lit edge (none if blank).
-///         - For blank edges:
-///             - The specified blank delay.
-/// 2. If the total is greater than `target_points`, we're done. If not, goto 3.
-/// 3. Determine a weight per lit edge based on the distance of each edge.
-/// 4. Distribute the remaining points between each lit edge distance based on their weights.
+/// In the case that the path *is* a circuit, the `end_corner` angle for the final edge will be
+/// derived from the angle between the last edge and the first edge.
 ///
-/// **Panic!**s if the given graph is not actually a `EulerCircuit`.
-pub fn interpolate_euler_circuit<P, R>(
-    points: &[P],
-    ec: &EulerCircuit,
-    eg: &EulerGraph,
-    target_points: u32,
-    conf: &InterpolationConfig,
-) -> Vec<R>
+/// If the path is *not* a circuit, the last edge profile will specify an `end_corner` angle of
+/// `0.0`.
+pub fn profile_path<'a, P, E>(
+    points: &'a [P],
+    edges: E,
+) -> impl 'a + Iterator<Item = (EdgeProfile, PointIndex, PointIndex)>
 where
+    P: Position + Weight,
+    E: 'a + IntoIterator<Item = Segment>,
+{
+    let mut iter = edges.into_iter();
+    let mut ab = iter.next();
+    let first = ab;
+    std::iter::from_fn(move || {
+        let bc = iter.next();
+        let profile = ab.take().map(|ab| {
+            let (a, b) = (ab.start, ab.end);
+            let c = bc
+                .map(|bc| bc.end)
+                .or_else(|| first.and_then(|f| if f.start == b { Some(f.end) } else { None }));
+            let ab_prof = EdgeProfile::from_abc(points, ab.kind, a, b, c);
+            (ab_prof, a, b)
+        });
+        ab = bc;
+        profile
+    })
+}
+
+/// Interpolate the path described by the given `edges`.
+///
+/// The interpolation process will generate at least `target_points` number of points along the
+/// given path. More points may be generated in the case that distance-per-point, blank-delay and
+/// sharp-angle-delay specified via `config` require more points.
+///
+/// Generated points will be appended to the given `output_points` buffer.
+///
+/// If the given `points` or `edges` slices are empty, or if the `edges` slice contains no lit
+/// edges, no points will be generated.
+pub fn interpolate_profiled_path<'a, P, R>(
+    points: &'a [P],
+    edges: &[(EdgeProfile, PointIndex, PointIndex)],
+    target_points: u32,
+    conf: &'a InterpolationConfig,
+    output_points: &mut Vec<R>,
+) where
     P: Clone + Into<R> + Position + Weight,
     R: Blanked + Clone + Lerp<Scalar = f32>,
 {
-    // Capture a profile of each edge to assist with interpolation.
-    #[derive(Debug)]
-    struct EdgeProfile {
-        a_weight: u32,
-        kind: EdgeProfileKind,
+    if points.is_empty() || edges.is_empty() || edges.iter().all(|&(e, _, _)| e.is_blank()) {
+        return;
     }
 
-    #[derive(Debug)]
-    enum EdgeProfileKind {
-        Blank,
-        Lit { distance: f32, end_corner: f32 },
-    }
-
-    impl EdgeProfile {
-        // Create an `EdgeProfile` for the edge at the given index.
-        fn from_index<P>(points: &[P], ix: usize, ec: &EulerCircuit, eg: &EulerGraph) -> Self
-        where
-            P: Position + Weight,
-        {
-            let (ab, ab_dir) = ec[ix];
-            let ab_kind = eg[ab];
-            let a_ix = ec_edge_start(eg, ab, ab_dir);
-            let a = &points[eg[a_ix] as usize];
-            let a_weight = a.weight();
-            let kind = match ab_kind {
-                SegmentKind::Blank => EdgeProfileKind::Blank,
-                SegmentKind::Lit => {
-                    let a_pos = a.position();
-                    let b_ix = ec_edge_end(eg, ab, ab_dir);
-                    let b = &points[eg[b_ix] as usize];
-                    let b_pos = b.position();
-                    let distance = distance_squared(a_pos, b_pos).sqrt();
-                    let next_ix = (ix + 1) % ec.len();
-                    let (bc, bc_dir) = ec[next_ix];
-                    let c_ix = ec_edge_end(eg, bc, bc_dir);
-                    let c = &points[eg[c_ix] as usize];
-                    let c_pos = c.position();
-                    let end_corner = straight_angle_variance(a_pos, b_pos, c_pos);
-                    EdgeProfileKind::Lit {
-                        distance,
-                        end_corner,
-                    }
-                }
-            };
-            EdgeProfile { a_weight, kind }
-        }
-
-        fn is_lit(&self) -> bool {
-            match self.kind {
-                EdgeProfileKind::Lit { .. } => true,
-                EdgeProfileKind::Blank => false,
-            }
-        }
-
-        // The lit distance covered by this edge.
-        fn lit_distance(&self) -> f32 {
-            match self.kind {
-                EdgeProfileKind::Lit { distance, .. } => distance,
-                _ => 0.0,
-            }
-        }
-
-        // The minimum number of points required to draw the edge.
-        fn min_points(&self, conf: &InterpolationConfig) -> u32 {
-            match self.kind {
-                EdgeProfileKind::Blank => {
-                    blank_segment_point_count(self.a_weight, conf.blank_delay_points)
-                }
-                EdgeProfileKind::Lit {
-                    distance,
-                    end_corner,
-                } => lit_segment_min_point_count(
-                    distance,
-                    end_corner,
-                    conf.distance_per_point,
-                    conf.radians_per_point,
-                    self.a_weight,
-                ),
-            }
-        }
-
-        // The points for this edge.
-        fn points<P, R>(
-            &self,
-            points: &[P],
-            e: EdgeIndex,
-            e_dir: Direction,
-            eg: &EulerGraph,
-            conf: &InterpolationConfig,
-            excess_points: u32,
-        ) -> Vec<R>
-        where
-            P: Clone + Into<R> + Position + Weight,
-            R: Blanked + Clone + Lerp<Scalar = f32>,
-        {
-            let a_ix = ec_edge_start(eg, e, e_dir);
-            let b_ix = ec_edge_end(eg, e, e_dir);
-            let a = points[eg[a_ix] as usize].clone();
-            let b = points[eg[b_ix] as usize].clone();
-            let br: R = b.into();
-            match self.kind {
-                EdgeProfileKind::Blank => {
-                    blank_segment_points(a, br, conf.blank_delay_points).collect()
-                }
-                EdgeProfileKind::Lit {
-                    end_corner,
-                    distance,
-                } => {
-                    let dist_point_count =
-                        distance_min_point_count(distance, conf.distance_per_point);
-                    let corner_point_count = corner_point_count(end_corner, conf.radians_per_point);
-                    lit_segment_points(a, br, corner_point_count, dist_point_count, excess_points)
-                        .collect()
-                }
-            }
-        }
-    }
-
-    // If the circuit is empty, so is our path.
-    if ec.is_empty() || target_points == 0 {
-        return vec![];
-    }
-
-    // Create a profile of each edge containing useful information for interpolation.
-    let edge_profiles = (0..ec.len())
-        .map(|ix| EdgeProfile::from_index(points, ix, ec, eg))
-        .collect::<Vec<_>>();
-
-    // TODO: If the circuit doesn't contain any lit edges, what should we do?
-    if !edge_profiles.iter().any(|ep| ep.is_lit()) {
-        return vec![];
-    }
-    // The minimum number of points required to display the image.
-    let min_points = edge_profiles
+    // The minimum number of points required to display the full path.
+    let min_points = edges
         .iter()
-        .map(|ep| ep.min_points(conf))
-        .fold(0, |acc, n| acc + n);
+        .fold(0, |acc, &(e, _, _)| acc + e.min_points(conf));
 
     // The target number of points not counting the last to be added at the end.
     let target_points_minus_last = target_points - 1;
@@ -946,9 +985,9 @@ where
         // A multiplier for determining excess points. This should be distributed across distance.
         let excess_points = target_points_minus_last - min_points;
         // The lit distance covered by each edge.
-        let edge_lit_dists = edge_profiles
+        let edge_lit_dists = edges
             .iter()
-            .map(|ep| (ep.is_lit(), ep.lit_distance()))
+            .map(|&(e, _, _)| (e.is_lit(), e.lit_distance()))
             .collect::<Vec<_>>();
         // The total lit distance covered by the traversal.
         let total_lit_dist = edge_lit_dists.iter().fold(0.0, |acc, &(_, d)| acc + d);
@@ -972,7 +1011,7 @@ where
         };
 
         // Multiply the weight by the excess points. Track fractional error and distribute.
-        let mut v = Vec::with_capacity(ec.len());
+        let mut v = Vec::with_capacity(edges.len());
         let mut err = 0.0;
         let mut count = 0;
         for (is_lit, w) in edge_weights {
@@ -990,10 +1029,10 @@ where
         // Check for rounding error.
         if count == (excess_points - 1) {
             // Find first lit edge index.
-            let (i, _) = edge_profiles
+            let (i, _) = edges
                 .iter()
                 .enumerate()
-                .find(|&(_, ep)| ep.is_lit())
+                .find(|&(_, &(e, _, _))| e.is_lit())
                 .expect("expected at least one lit edge");
             v[i] += 1;
             count += 1;
@@ -1004,29 +1043,74 @@ where
 
         v
     } else {
-        vec![0; ec.len()]
+        vec![0; edges.len()]
     };
 
     // Collect all points.
-    let total_points = std::cmp::max(min_points, target_points);
-    let mut new_points = Vec::with_capacity(total_points as usize);
-    for elem in ec.iter().zip(&edge_profiles).zip(&edge_excess_point_counts) {
-        let ((&(e_ix, e_dir), ep), &excess) = elem;
-        new_points.extend(ep.points(points, e_ix, e_dir, eg, conf, excess));
+    for (&(prof, a_ix, b_ix), &excess) in edges.iter().zip(&edge_excess_point_counts) {
+        output_points.extend(prof.points(points, a_ix, b_ix, conf, excess));
     }
 
     // Push the last point.
-    let last_point = {
-        let &(e, dir) = ec.last().unwrap();
-        let end = ec_edge_end(eg, e, dir);
-        &points[eg[end] as usize]
-    };
-    new_points.push(last_point.clone().into());
+    let last_point = points[edges.last().unwrap().2 as usize].clone().into();
+    output_points.push(last_point);
 
     // Sanity check that we generated at least `target_points`.
-    debug_assert!(new_points.len() >= target_points as usize);
+    let total_points = std::cmp::max(min_points, target_points);
+    debug_assert!(output_points.len() >= target_points as usize);
+    debug_assert!(total_points >= target_points);
+}
 
-    new_points
+/// The same as `interpolate_profiled_path`, but performs the path profiling step internally prior
+/// to interpolation.
+pub fn interpolate_path<'a, P, E, R>(
+    points: &'a [P],
+    edges: E,
+    target_points: u32,
+    conf: &'a InterpolationConfig,
+    output_points: &mut Vec<R>,
+) where
+    P: Clone + Into<R> + Position + Weight,
+    E: IntoIterator<Item = Segment>,
+    R: Blanked + Clone + Lerp<Scalar = f32>,
+{
+    let profiled_edges: Vec<_> = profile_path(points, edges).collect();
+    interpolate_profiled_path(points, &profiled_edges, target_points, conf, output_points);
+}
+
+/// Produce an iterator yielding `Segment`s representing the euler circuit's path through the euler
+/// graph.
+pub fn euler_circuit_to_segments<'a>(
+    ec: &'a EulerCircuit,
+    eg: &'a EulerGraph,
+) -> impl 'a + Iterator<Item = Segment> {
+    ec.iter().map(move |&(e_ix, e_dir)| {
+        let kind = eg[e_ix];
+        let start = eg[ec_edge_start(eg, e_ix, e_dir)];
+        let end = eg[ec_edge_end(eg, e_ix, e_dir)];
+        Segment { kind, start, end }
+    })
+}
+
+/// Interpolate the given `EulerCircuit` with the given configuration.
+///
+/// This is short-hand for calling `interpolate_path` for when working with a euler graph and
+/// circuit for draw order optimisation.
+pub fn interpolate_euler_circuit<P, R>(
+    points: &[P],
+    ec: &EulerCircuit,
+    eg: &EulerGraph,
+    target_points: u32,
+    conf: &InterpolationConfig,
+) -> Vec<R>
+where
+    P: Clone + Into<R> + Position + Weight,
+    R: Blanked + Clone + Lerp<Scalar = f32>,
+{
+    let edges = euler_circuit_to_segments(ec, eg);
+    let mut output_points = vec![];
+    interpolate_path(points, edges, target_points, conf, &mut output_points);
+    output_points
 }
 
 // ----------------------------------------------------------------------------
